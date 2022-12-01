@@ -1,0 +1,210 @@
+package com.apps.restfulApp.security;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwsHeader;
+import io.jsonwebtoken.Jwt;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SigningKeyResolverAdapter;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.math.BigInteger;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.security.Key;
+import java.security.KeyFactory;
+import java.security.NoSuchAlgorithmException;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.RSAPublicKeySpec;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+
+import org.cache2k.Cache;
+import org.cache2k.Cache2kBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+@Service
+public class TokenValidatorImpl implements TokenValidator {
+   private static final Logger log = LoggerFactory.getLogger(TokenValidator.class);
+   private static final String JWK_VERSION = "jwk_version";
+   private static final String MODULUS = "modulus";
+   private static final String EXPONENT = "exponent";
+   
+   
+   private static final String KEY_SUBJECT = "key";
+   private static final String KEY_NAME = "name";
+
+   @Value("${spring.dataservices.jwksHostName}")
+   private String jwksHostName = "https://jwt.io";
+
+   @Value("${spring.dataservices.jwk.secretkey}")
+   private String secretkey = "ramesh08816FirstTest";
+
+   @Value("${spring.dataservices.jwk.clientId}")
+   private String clientId = "alpha";
+
+   static final Cache<String, String> _cache = (new Cache2kBuilder<String, String>() {}).eternal(true).build();
+   
+   static String jwkVersionCache;
+   static String modulusCache;
+   static String exponentCache;
+
+   static {
+      jwkVersionCache = _cache.peek(JWK_VERSION);
+      modulusCache = _cache.peek(MODULUS);
+      exponentCache = _cache.peek(EXPONENT);
+   }
+
+   @Override
+   public boolean validateToken(String signedJwtToken) {
+      boolean tokenValid = true;
+      StringBuilder sb = null;
+      Jwt<?, Claims> jwtClaims = null;
+      long startTime = System.currentTimeMillis();
+
+      try {
+         sb = new StringBuilder();
+         sb.append(signedJwtToken);
+
+         String jwtWithoutSignature = sb.substring(0, sb.toString().lastIndexOf('.') + 1);
+         jwtClaims = Jwts.parser().parseClaimsJwt(jwtWithoutSignature);
+
+         String keyValue = (String) ((Claims) jwtClaims.getBody()).get(KEY_SUBJECT);
+         String keyName = (String) ((Claims) jwtClaims.getBody()).get(KEY_NAME);
+
+         
+         
+         String jwtVersion = (String) ((Claims) jwtClaims.getBody()).get("ver");
+         String kid = (String) jwtClaims.getHeader().get("kid");
+         if (_cache.get(JWK_VERSION) != null) {
+            if (!jwtVersion.equals(jwkVersionCache)) {
+               this.getJWK(this.jwksHostName, kid);
+            } else {
+               log.info("using jwk from cache");
+            }
+         } else {
+            this.getJWK(this.jwksHostName, kid);
+         }
+
+         SigningKeyResolverAdapter resolver = new SigningKeyResolverAdapter() {
+        	@Override
+            public Key resolveSigningKey(JwsHeader jwsHeader, Claims claims) {
+               try {
+                  BigInteger modulus = new BigInteger(1, Base64.getUrlDecoder().decode(TokenValidatorImpl.modulusCache));
+                  BigInteger exponent = new BigInteger(1, Base64.getUrlDecoder().decode(TokenValidatorImpl.exponentCache));
+                  return KeyFactory.getInstance("RSA").generatePublic(new RSAPublicKeySpec(modulus, exponent));
+               } catch (NoSuchAlgorithmException var6) {
+                  log.error("Failed to resolve key: ", var6);
+                  return null;
+               } catch (InvalidKeySpecException var7) {
+                  log.error("Failed to resolve key: ", var7);
+                  return null;
+               }
+            }
+         };
+
+         tokenValid = validateJwsSignature(resolver, signedJwtToken);
+      } catch (Exception var13) {
+         log.error("JWT is malformed or expired");
+         tokenValid = false;
+      }
+
+      long endTime = System.currentTimeMillis();
+      log.info("Total time taken to validate JWT token is : {}{}", (endTime - startTime), " ms");
+      return tokenValid;
+   }
+
+   private void getJWK(String jwkUrl, String kid) {
+      log.info("Making call to JWKS URL as cache is empty");
+      HttpURLConnection connection = null;
+
+     try {
+         long start = System.currentTimeMillis();
+         URL url = new URL(jwkUrl);
+         connection = (HttpURLConnection)url.openConnection();
+         connection.setRequestProperty("x-ibm-client-secret", this.secretkey);
+         connection.setRequestProperty("x-ibm-client-id", this.clientId);
+         connection.setRequestMethod("GET");
+	         
+         StringBuilder response = getJwksResponse(connection);
+
+         long end = System.currentTimeMillis();
+         log.info("Time takn to call JWKS APis : {}{}", (end - start), " ms");
+         TypeReference<Map<String, Object>> typeRef = new TypeReference<Map<String, Object>>() {
+         };
+         ObjectMapper mapper = new ObjectMapper();
+         Map<String, Object> jwks = mapper.readValue(response.toString(), typeRef);
+         Map<String, String> jwk = getKeyById(jwks, kid);
+         if (jwk != null) {
+            _cache.put(MODULUS, jwk.get("n"));
+            TokenValidatorImpl.setModulusCache();
+            _cache.put(EXPONENT, jwk.get("e"));
+            TokenValidatorImpl.setExponentCache();
+            _cache.put(JWK_VERSION, jwk.get("ver"));
+            TokenValidatorImpl.setJwkVersionCache();
+         }
+      } catch (Exception var19) {
+         log.error("Error/Exception getting jwks: ", var19);
+      } finally {
+         if (connection != null) {
+            connection.disconnect();
+         }
+      }
+
+   }
+
+   private static Map<String, String> getKeyById(Map<String, Object> jwks, String kid) {
+      List<Map<String, String>> keys = (List)jwks.get("keys");
+      Map<String, String> ret = null;
+
+      for(int i = 0; i < keys.size(); ++i) {
+         if (((String)((Map)keys.get(i)).get("kid")).equals(kid)) {
+            return keys.get(i);
+         }
+      }
+      return ret;
+   }
+   
+   private static void setModulusCache() {
+       modulusCache = _cache.get(MODULUS);
+	}
+   
+   private static void setExponentCache() {
+       exponentCache = _cache.get(EXPONENT);
+	}
+   
+   private static void setJwkVersionCache() {
+       jwkVersionCache = _cache.get(JWK_VERSION);
+	}
+   
+   private boolean validateJwsSignature(SigningKeyResolverAdapter resolver, String signedJwtToken) {
+	   try {
+           Jwts.parser().setSigningKeyResolver(resolver).parseClaimsJws(signedJwtToken);
+           log.info("Signature on this JWT is good and the JWT token has not expired");
+        } catch (Exception var12) {
+           log.error("Unable to validate JWS ", var12);
+           return false;
+        }
+	   return true;
+	}
+   
+   private StringBuilder getJwksResponse(HttpURLConnection connection) {
+	   StringBuilder response = new StringBuilder();
+	   try (BufferedReader bf = new BufferedReader(new InputStreamReader(connection.getInputStream()))){	
+	         String line;
+	         while((line = bf.readLine()) != null) {
+	            response.append(line);
+	            response.append('\r');
+       }
+       }
+       catch(Exception e) {
+      	 log.error("Error when getting JWKS response: ", e);
+       }
+	   return response;
+	}
+}
