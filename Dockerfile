@@ -1,4 +1,12 @@
 #
+# To compile:
+#    docker build -t restful-app-with-static-data .
+#
+# To run: 
+#    docker run -p 8080:8080 restful-app-with-static-data
+#
+
+#
 # Build stage
 #
 
